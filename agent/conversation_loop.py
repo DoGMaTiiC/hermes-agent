@@ -73,76 +73,6 @@ from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
 
-_PROVIDER_REPLAY_REASONING_FIELDS = (
-    "reasoning_content",
-    "reasoning_details",
-    "codex_reasoning_items",
-    "codex_message_items",
-)
-
-
-def _strip_opaque_reasoning_on_provider_switch(agent: Any, api_messages: List[Dict[str, Any]]) -> int:
-    """Strip provider-specific encrypted reasoning when replay crosses providers.
-
-    Encrypted reasoning blobs (OpenAI/Codex ``encrypted_content``, xAI
-    Responses equivalents, OpenRouter/Anthropic ``reasoning_details``) are
-    only valid for the provider/model session that minted them.  Gateway
-    chats can switch model/provider while keeping the same Hermes session
-    history, so replaying old opaque blobs into the new backend can hard-fail
-    with HTTP 400 ("could not decrypt encrypted_content").
-
-    The session row stores the provider/model that first populated billing
-    metadata.  If the active provider/model differs, keep visible assistant
-    content and tool structure but drop provider-facing reasoning fields from
-    the per-call API copy.  The persisted transcript remains unchanged.
-    """
-    session_id = getattr(agent, "session_id", None)
-    if not session_id:
-        return 0
-
-    current_provider = (getattr(agent, "provider", None) or "").strip()
-    current_model = (getattr(agent, "model", None) or "").strip()
-    if not current_provider and not current_model:
-        return 0
-
-    try:
-        from hermes_state import SessionDB
-
-        row = SessionDB().get_session(session_id)
-    except Exception:
-        return 0
-    if not row:
-        return 0
-
-    original_provider = (row.get("billing_provider") or "").strip() if hasattr(row, "get") else ""
-    original_model = (row.get("model") or "").strip() if hasattr(row, "get") else ""
-    provider_changed = bool(original_provider and current_provider and original_provider != current_provider)
-    model_changed = bool(original_model and current_model and original_model != current_model)
-    if not (provider_changed or model_changed):
-        return 0
-
-    stripped = 0
-    for msg in api_messages:
-        if not isinstance(msg, dict) or msg.get("role") != "assistant":
-            continue
-        for field in _PROVIDER_REPLAY_REASONING_FIELDS:
-            if msg.pop(field, None):
-                stripped += 1
-
-    if stripped:
-        logger.warning(
-            "Provider/model switch detected for session %s: %s/%s -> %s/%s; "
-            "stripped %s provider-specific reasoning field(s) from API replay",
-            session_id,
-            original_provider or "?",
-            original_model or "?",
-            current_provider or "?",
-            current_model or "?",
-            stripped,
-        )
-    return stripped
-
-
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -1026,12 +956,6 @@ def run_conversation(
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
 
-        # If this gateway session switched provider/model, old encrypted
-        # reasoning blobs are no longer decryptable by the new backend.
-        # Strip only from the API replay copy; keep visible transcript and
-        # persisted session history intact.
-        _strip_opaque_reasoning_on_provider_switch(agent, api_messages)
-
         # Calculate approximate request size for logging
         total_chars = sum(len(str(msg)) for msg in api_messages)
         approx_tokens = estimate_messages_tokens_rough(api_messages)
@@ -1545,6 +1469,10 @@ def run_conversation(
                     if agent.api_mode == "anthropic_messages":
                         _trunc_result = _trunc_transport.normalize_response(
                             response, strip_tool_prefix=agent._is_anthropic_oauth
+                        )
+                    elif agent.api_mode == "codex_responses":
+                        _trunc_result = _trunc_transport.normalize_response(
+                            response, provider=agent.provider
                         )
                     else:
                         _trunc_result = _trunc_transport.normalize_response(response)
@@ -3196,6 +3124,8 @@ def run_conversation(
             _normalize_kwargs = {}
             if agent.api_mode == "anthropic_messages":
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
+            elif agent.api_mode == "codex_responses":
+                _normalize_kwargs["provider"] = agent.provider
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason

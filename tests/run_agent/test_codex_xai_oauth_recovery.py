@@ -18,16 +18,11 @@ Three distinct failure modes the user community hit during rollout:
    as a confusing wall of JSON.  ``_summarize_api_error`` now appends a
    one-line hint pointing the user at https://grok.com and ``/model``.
 
-3. Multi-turn replay of ``codex_reasoning_items`` (with
-   ``encrypted_content``) was briefly suppressed for ``is_xai_responses``
-   in PR #26644 on the theory that xAI's OAuth/SuperGrok surface
-   rejected replayed encrypted reasoning items.  That suppression was
-   reverted shortly after: xAI confirmed they explicitly want Hermes to
-   thread encrypted reasoning back across turns, and the original
-   multi-turn failure mode was actually the prelude-SSE issue closed by
-   Fix A above.  The remaining tests here lock in that xAI receives
-   replayed reasoning AND that we ask xAI to echo it back in the
-   ``include`` array.
+3. Multi-turn replay of provider-tagged ``codex_reasoning_items`` (with
+   ``encrypted_content``) must continue for xAI, but legacy unknown-origin
+   blobs must not be replayed into xAI after a provider switch.  That is the
+   #31062-style workaround: tag new reasoning with ``source_provider`` and
+   filter cross-provider/unknown-origin opaque blobs before the API call.
 """
 
 from types import SimpleNamespace
@@ -289,7 +284,11 @@ def test_classify_api_error_stream_event_unrelated_not_reclassified():
 # ---------------------------------------------------------------------------
 
 
-def _assistant_msg_with_encrypted_reasoning(text="hi from grok", encrypted="enc_blob"):
+def _assistant_msg_with_encrypted_reasoning(
+    text="hi from grok",
+    encrypted="enc_blob",
+    source_provider="xai-oauth",
+):
     return {
         "role": "assistant",
         "content": text,
@@ -299,6 +298,7 @@ def _assistant_msg_with_encrypted_reasoning(text="hi from grok", encrypted="enc_
                 "id": "rs_xai_001",
                 "encrypted_content": encrypted,
                 "summary": [],
+                **({"source_provider": source_provider} if source_provider is not None else {}),
             }
         ],
     }
@@ -320,15 +320,8 @@ def test_codex_reasoning_replay_default_includes_encrypted_content():
     assert reasoning[0]["encrypted_content"] == "enc_blob"
 
 
-def test_codex_reasoning_replay_includes_encrypted_content_for_xai():
-    """xAI must receive replayed encrypted reasoning items (May 2026 reversal).
-
-    Earlier we stripped these on the theory that the OAuth/SuperGrok
-    surface rejected them.  xAI subsequently confirmed they explicitly
-    want Hermes to thread encrypted reasoning back across turns for
-    cross-turn coherence — that's the whole point of the partnership
-    integration.
-    """
+def test_codex_reasoning_replay_includes_provider_tagged_encrypted_content_for_xai():
+    """xAI must receive replayed encrypted reasoning items minted by xAI."""
     from agent.codex_responses_adapter import _chat_messages_to_responses_input
 
     msgs = [
@@ -337,13 +330,15 @@ def test_codex_reasoning_replay_includes_encrypted_content_for_xai():
         {"role": "user", "content": "what's your name?"},
     ]
 
-    items = _chat_messages_to_responses_input(msgs, is_xai_responses=True)
-    reasoning = [it for it in items if it.get("type") == "reasoning"]
-    assert len(reasoning) == 1, (
-        "xAI must receive replayed reasoning items — see docstring for the "
-        "May 2026 reversal of the earlier suppression gate."
+    items = _chat_messages_to_responses_input(
+        msgs,
+        is_xai_responses=True,
+        reasoning_provider="xai-oauth",
     )
+    reasoning = [it for it in items if it.get("type") == "reasoning"]
+    assert len(reasoning) == 1, "xAI must receive replayed reasoning items minted by xAI."
     assert reasoning[0]["encrypted_content"] == "enc_blob"
+    assert "source_provider" not in reasoning[0]
 
     # And the assistant's visible text must still be present alongside it.
     assistant_items = [
@@ -393,6 +388,7 @@ def test_codex_transport_xai_replays_reasoning_in_input():
         instructions="sys",
         reasoning_config={"enabled": True, "effort": "medium"},
         is_xai_responses=True,
+        provider="xai-oauth",
     )
     input_items = kwargs["input"]
     reasoning_items = [it for it in input_items if it.get("type") == "reasoning"]
@@ -426,27 +422,10 @@ def test_codex_transport_native_codex_still_replays_reasoning_in_input():
     assert "reasoning.encrypted_content" in kwargs.get("include", [])
 
 
-def test_provider_switch_strips_opaque_reasoning_from_api_replay(monkeypatch):
-    """Switching provider in one gateway session must not replay stale encrypted blobs.
+def test_xai_filters_legacy_unknown_origin_encrypted_reasoning():
+    """Legacy untagged blobs must not be replayed into xAI."""
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
 
-    A session that started on openai-codex can later be routed to xAI OAuth
-    without starting a new Hermes session.  The encrypted reasoning items
-    stored from Codex are not decryptable by xAI, so the per-call API copy
-    must drop them while keeping visible assistant text/tool structure.
-    """
-    from agent.conversation_loop import _strip_opaque_reasoning_on_provider_switch
-
-    class _DB:
-        def get_session(self, _session_id):
-            return {"billing_provider": "openai-codex", "model": "gpt-5.5"}
-
-    monkeypatch.setattr("hermes_state.SessionDB", lambda: _DB())
-
-    agent = SimpleNamespace(
-        session_id="sess-1",
-        provider="xai-oauth",
-        model="grok-4.3",
-    )
     api_messages = [
         {"role": "user", "content": "next"},
         {
@@ -454,49 +433,71 @@ def test_provider_switch_strips_opaque_reasoning_from_api_replay(monkeypatch):
             "content": "visible text stays",
             "reasoning_content": "hidden text",
             "reasoning_details": [{"encrypted_content": "or-blob"}],
-            "codex_reasoning_items": [{"encrypted_content": "codex-blob"}],
+            "codex_reasoning_items": [{"type": "reasoning", "encrypted_content": "codex-blob"}],
             "codex_message_items": [{"type": "message", "id": "msg_1"}],
         },
     ]
 
-    stripped = _strip_opaque_reasoning_on_provider_switch(agent, api_messages)
-
-    assert stripped == 4
-    assistant = api_messages[1]
-    assert assistant["content"] == "visible text stays"
-    assert "reasoning_content" not in assistant
-    assert "reasoning_details" not in assistant
-    assert "codex_reasoning_items" not in assistant
-    assert "codex_message_items" not in assistant
-
-
-def test_same_provider_keeps_opaque_reasoning_for_replay(monkeypatch):
-    """Same-provider multi-turn replay still preserves encrypted reasoning."""
-    from agent.conversation_loop import _strip_opaque_reasoning_on_provider_switch
-
-    class _DB:
-        def get_session(self, _session_id):
-            return {"billing_provider": "xai-oauth", "model": "grok-4.3"}
-
-    monkeypatch.setattr("hermes_state.SessionDB", lambda: _DB())
-
-    agent = SimpleNamespace(
-        session_id="sess-1",
-        provider="xai-oauth",
-        model="grok-4.3",
+    items = _chat_messages_to_responses_input(
+        api_messages,
+        is_xai_responses=True,
+        reasoning_provider="xai-oauth",
     )
+
+    assert not [it for it in items if it.get("type") == "reasoning"]
+    assert any(
+        it.get("role") == "assistant" and it.get("content") == "visible text stays"
+        for it in items
+    )
+
+
+def test_same_provider_keeps_tagged_opaque_reasoning_for_replay():
+    """Same-provider multi-turn replay still preserves encrypted reasoning."""
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
     api_messages = [
         {
             "role": "assistant",
             "content": "ok",
-            "codex_reasoning_items": [{"encrypted_content": "same-provider-blob"}],
+            "codex_reasoning_items": [
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "same-provider-blob",
+                    "source_provider": "xai-oauth",
+                }
+            ],
         }
     ]
 
-    stripped = _strip_opaque_reasoning_on_provider_switch(agent, api_messages)
+    items = _chat_messages_to_responses_input(
+        api_messages,
+        is_xai_responses=True,
+        reasoning_provider="xai-oauth",
+    )
 
-    assert stripped == 0
-    assert api_messages[0]["codex_reasoning_items"][0]["encrypted_content"] == "same-provider-blob"
+    reasoning = [it for it in items if it.get("type") == "reasoning"]
+    assert len(reasoning) == 1
+    assert reasoning[0]["encrypted_content"] == "same-provider-blob"
+
+
+def test_xai_filters_cross_provider_encrypted_reasoning():
+    """Codex/OpenAI blobs must not be replayed into xAI."""
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+    api_messages = [
+        _assistant_msg_with_encrypted_reasoning(
+            encrypted="codex-blob",
+            source_provider="openai-codex",
+        )
+    ]
+
+    items = _chat_messages_to_responses_input(
+        api_messages,
+        is_xai_responses=True,
+        reasoning_provider="xai-oauth",
+    )
+
+    assert not [it for it in items if it.get("type") == "reasoning"]
 
 
 # ---------------------------------------------------------------------------
