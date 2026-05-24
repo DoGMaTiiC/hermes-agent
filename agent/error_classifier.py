@@ -294,6 +294,18 @@ _AUTH_PATTERNS = [
     "access denied",
 ]
 
+# Anthropic / Responses encrypted-reasoning invalidation patterns.
+# These opaque blobs can be invalidated by provider/model switches, prompt
+# changes, context compression, or transcript replay mutations.  Recovery is
+# to strip replayed encrypted reasoning state and retry once.
+_ENCRYPTED_REASONING_INVALID_PATTERNS = [
+    "invalid_encrypted_content",
+    "encrypted content could not be decrypted",
+    "encrypted content could not be verified",
+    "could not decrypt the provided encrypted_content",
+    "unmodified encrypted_content from a previous response",
+]
+
 # Anthropic thinking block signature patterns
 _THINKING_SIG_PATTERNS = [
     "signature",  # Combined with "thinking" check
@@ -842,6 +854,16 @@ def _classify_400(
     result_fn,
 ) -> ClassifiedError:
     """Classify 400 Bad Request — context overflow, format error, or generic."""
+
+    # Encrypted reasoning replay invalidated (OpenAI Codex Responses, xAI
+    # Responses, Anthropic/OpenRouter-style opaque thinking blocks). Treat as
+    # recoverable thinking-signature drift so the conversation loop strips
+    # stale encrypted reasoning state and retries instead of falling back.
+    if any(p in error_msg for p in _ENCRYPTED_REASONING_INVALID_PATTERNS):
+        return result_fn(
+            FailoverReason.thinking_signature,
+            retryable=True,
+        )
 
     # Multimodal tool content rejected from 400.  Must be checked BEFORE
     # image_too_large because the recovery is different (strip image parts

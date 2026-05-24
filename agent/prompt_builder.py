@@ -74,6 +74,7 @@ def _find_git_root(start: Path) -> Optional[Path]:
 
 
 _HERMES_MD_NAMES = (".hermes.md", "HERMES.md")
+_GLOBAL_CONTEXT_NAMES = ("HERMES.md", "AGENTS.md", "CLAUDE.md")
 
 
 def _find_hermes_md(cwd: Path) -> Optional[Path]:
@@ -112,6 +113,38 @@ def _strip_yaml_frontmatter(content: str) -> str:
             body = content[end + 4:].lstrip("\n")
             return body if body else content
     return content
+
+
+def _load_global_context_md() -> tuple[str, Optional[Path]]:
+    """Load one global Hermes context file from ``HERMES_HOME``.
+
+    Priority:
+      1. HERMES.md
+      2. AGENTS.md
+      3. CLAUDE.md
+
+    Returns ``(content, path)`` so project-context discovery can avoid
+    reinjecting the same file when ``cwd`` is ``HERMES_HOME``.
+    """
+    hermes_home = get_hermes_home().resolve()
+
+    for name in _GLOBAL_CONTEXT_NAMES:
+        candidate = hermes_home / name
+        if not candidate.is_file():
+            continue
+        try:
+            content = candidate.read_text(encoding="utf-8").strip()
+            if not content:
+                continue
+            content = _strip_yaml_frontmatter(content)
+            display_name = f"~/.hermes/{name}"
+            content = _scan_context_content(content, display_name)
+            result = f"## Global Hermes Context: {display_name}\n\n{content}"
+            return _truncate_content(result, f"global {name}"), candidate.resolve()
+        except Exception as e:
+            logger.debug("Could not read global context %s: %s", candidate, e)
+
+    return "", None
 
 
 # =========================================================================
@@ -1325,10 +1358,12 @@ def load_soul_md() -> Optional[str]:
         return None
 
 
-def _load_hermes_md(cwd_path: Path) -> str:
+def _load_hermes_md(cwd_path: Path, exclude_paths: Optional[set[Path]] = None) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)
     if not hermes_md_path:
+        return ""
+    if exclude_paths and hermes_md_path.resolve() in exclude_paths:
         return ""
     try:
         content = hermes_md_path.read_text(encoding="utf-8").strip()
@@ -1348,10 +1383,12 @@ def _load_hermes_md(cwd_path: Path) -> str:
         return ""
 
 
-def _load_agents_md(cwd_path: Path) -> str:
+def _load_agents_md(cwd_path: Path, exclude_paths: Optional[set[Path]] = None) -> str:
     """AGENTS.md — top-level only (no recursive walk)."""
     for name in ["AGENTS.md", "agents.md"]:
         candidate = cwd_path / name
+        if exclude_paths and candidate.resolve() in exclude_paths:
+            continue
         if candidate.exists():
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
@@ -1364,10 +1401,12 @@ def _load_agents_md(cwd_path: Path) -> str:
     return ""
 
 
-def _load_claude_md(cwd_path: Path) -> str:
+def _load_claude_md(cwd_path: Path, exclude_paths: Optional[set[Path]] = None) -> str:
     """CLAUDE.md / claude.md — cwd only."""
     for name in ["CLAUDE.md", "claude.md"]:
         candidate = cwd_path / name
+        if exclude_paths and candidate.resolve() in exclude_paths:
+            continue
         if candidate.exists():
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
@@ -1413,7 +1452,13 @@ def _load_cursorrules(cwd_path: Path) -> str:
 def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = False) -> str:
     """Discover and load context files for the system prompt.
 
-    Priority (first found wins — only ONE project context type is loaded):
+    Global context from ``HERMES_HOME`` (first found wins):
+      1. HERMES.md
+      2. AGENTS.md
+      3. CLAUDE.md
+
+    Project context from ``cwd`` (first found wins — only ONE project context
+    type is loaded):
       1. .hermes.md / HERMES.md  (walk to git root)
       2. AGENTS.md / agents.md   (cwd only)
       3. CLAUDE.md / claude.md   (cwd only)
@@ -1431,11 +1476,16 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
     cwd_path = Path(cwd).resolve()
     sections = []
 
+    global_context, global_context_path = _load_global_context_md()
+    exclude_paths = {global_context_path} if global_context_path else set()
+    if global_context:
+        sections.append(global_context)
+
     # Priority-based project context: first match wins
     project_context = (
-        _load_hermes_md(cwd_path)
-        or _load_agents_md(cwd_path)
-        or _load_claude_md(cwd_path)
+        _load_hermes_md(cwd_path, exclude_paths=exclude_paths)
+        or _load_agents_md(cwd_path, exclude_paths=exclude_paths)
+        or _load_claude_md(cwd_path, exclude_paths=exclude_paths)
         or _load_cursorrules(cwd_path)
     )
     if project_context:

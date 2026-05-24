@@ -535,6 +535,29 @@ class TestClassifyApiError:
         # Without "thinking" in the message, it shouldn't be thinking_signature
         assert result.reason != FailoverReason.thinking_signature
 
+    def test_responses_invalid_encrypted_content_is_recoverable_thinking_signature(self):
+        e = MockAPIError(
+            "The encrypted content Vr8z...gZ4w could not be verified. "
+            "Reason: Encrypted content could not be decrypted or parsed.",
+            status_code=400,
+            body={"error": {"code": "invalid_encrypted_content"}},
+        )
+        result = classify_api_error(e, provider="openai-codex", model="gpt-5.5")
+        assert result.reason == FailoverReason.thinking_signature
+        assert result.retryable is True
+        assert result.should_fallback is False
+
+    def test_xai_invalid_encrypted_content_is_recoverable_thinking_signature(self):
+        e = MockAPIError(
+            "Could not decrypt the provided encrypted_content. Ensure the value is "
+            "the unmodified encrypted_content from a previous response.",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="xai-oauth", model="grok-4.3")
+        assert result.reason == FailoverReason.thinking_signature
+        assert result.retryable is True
+        assert result.should_fallback is False
+
     # ── Provider-specific: llama.cpp grammar-parse ──
 
     def test_llama_cpp_grammar_parse_error(self):

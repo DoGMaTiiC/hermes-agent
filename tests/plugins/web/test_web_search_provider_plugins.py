@@ -2,8 +2,8 @@
 
 Covers:
 
-- All eight bundled plugins (brave-free, ddgs, searxng, exa, parallel,
-  tavily, firecrawl, xai) instantiate and self-report the expected
+- All nine bundled plugins (brave-free, ddgs, searxng, exa, parallel,
+  tavily, firecrawl, scrapling, xai) instantiate and self-report the expected
   capabilities + ABC-derived defaults.
 - Each plugin's ``is_available()`` correctly reflects env-var presence.
 - The web_search_registry resolves an active provider in the documented
@@ -71,7 +71,7 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestBundledPluginsRegister:
-    """All eight bundled web plugins discover and register correctly."""
+    """All bundled web plugins discover and register correctly."""
 
     def test_all_seven_plugins_present_in_registry(self) -> None:
         _ensure_plugins_loaded()
@@ -84,6 +84,7 @@ class TestBundledPluginsRegister:
             "exa",
             "firecrawl",
             "parallel",
+            "scrapling",
             "searxng",
             "tavily",
             "xai",
@@ -97,6 +98,7 @@ class TestBundledPluginsRegister:
             ("searxng", True, False, False),
             ("exa", True, True, False),
             ("parallel", True, True, False),
+            ("scrapling", False, True, False),
             ("tavily", True, True, True),
             # firecrawl: search + extract + crawl. Crawl was originally
             # disabled in the migration (fell through to a legacy inline
@@ -124,7 +126,7 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
+        ["brave-free", "ddgs", "searxng", "exa", "parallel", "scrapling", "tavily", "firecrawl", "xai"],
     )
     def test_each_plugin_has_name_and_display_name(self, plugin_name: str) -> None:
         _ensure_plugins_loaded()
@@ -137,7 +139,7 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
+        ["brave-free", "ddgs", "searxng", "exa", "parallel", "scrapling", "tavily", "firecrawl", "xai"],
     )
     def test_each_plugin_has_setup_schema(self, plugin_name: str) -> None:
         """``get_setup_schema()`` returns a dict the picker can consume."""
@@ -241,6 +243,16 @@ class TestIsAvailable:
         p = get_provider("ddgs")
         assert p is not None
         # Truthy or falsy, just must not raise.
+        _ = bool(p.is_available())
+
+    def test_scrapling_available_when_package_importable(self) -> None:
+        """Scrapling is a local no-key extract backend when installed."""
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
+
+        p = get_provider("scrapling")
+        assert p is not None
+        # Truthy or falsy, just must not raise (package may be absent in CI).
         _ = bool(p.is_available())
 
     def test_xai_requires_api_key_or_oauth(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -374,6 +386,14 @@ class TestAsyncExtractDispatch:
         from agent.web_search_registry import get_provider
 
         p = get_provider("tavily")
+        assert p is not None
+        assert inspect.iscoroutinefunction(p.extract) is False
+
+    def test_scrapling_extract_is_sync(self) -> None:
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
+
+        p = get_provider("scrapling")
         assert p is not None
         assert inspect.iscoroutinefunction(p.extract) is False
 

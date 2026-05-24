@@ -426,6 +426,79 @@ def test_codex_transport_native_codex_still_replays_reasoning_in_input():
     assert "reasoning.encrypted_content" in kwargs.get("include", [])
 
 
+def test_provider_switch_strips_opaque_reasoning_from_api_replay(monkeypatch):
+    """Switching provider in one gateway session must not replay stale encrypted blobs.
+
+    A session that started on openai-codex can later be routed to xAI OAuth
+    without starting a new Hermes session.  The encrypted reasoning items
+    stored from Codex are not decryptable by xAI, so the per-call API copy
+    must drop them while keeping visible assistant text/tool structure.
+    """
+    from agent.conversation_loop import _strip_opaque_reasoning_on_provider_switch
+
+    class _DB:
+        def get_session(self, _session_id):
+            return {"billing_provider": "openai-codex", "model": "gpt-5.5"}
+
+    monkeypatch.setattr("hermes_state.SessionDB", lambda: _DB())
+
+    agent = SimpleNamespace(
+        session_id="sess-1",
+        provider="xai-oauth",
+        model="grok-4.3",
+    )
+    api_messages = [
+        {"role": "user", "content": "next"},
+        {
+            "role": "assistant",
+            "content": "visible text stays",
+            "reasoning_content": "hidden text",
+            "reasoning_details": [{"encrypted_content": "or-blob"}],
+            "codex_reasoning_items": [{"encrypted_content": "codex-blob"}],
+            "codex_message_items": [{"type": "message", "id": "msg_1"}],
+        },
+    ]
+
+    stripped = _strip_opaque_reasoning_on_provider_switch(agent, api_messages)
+
+    assert stripped == 4
+    assistant = api_messages[1]
+    assert assistant["content"] == "visible text stays"
+    assert "reasoning_content" not in assistant
+    assert "reasoning_details" not in assistant
+    assert "codex_reasoning_items" not in assistant
+    assert "codex_message_items" not in assistant
+
+
+def test_same_provider_keeps_opaque_reasoning_for_replay(monkeypatch):
+    """Same-provider multi-turn replay still preserves encrypted reasoning."""
+    from agent.conversation_loop import _strip_opaque_reasoning_on_provider_switch
+
+    class _DB:
+        def get_session(self, _session_id):
+            return {"billing_provider": "xai-oauth", "model": "grok-4.3"}
+
+    monkeypatch.setattr("hermes_state.SessionDB", lambda: _DB())
+
+    agent = SimpleNamespace(
+        session_id="sess-1",
+        provider="xai-oauth",
+        model="grok-4.3",
+    )
+    api_messages = [
+        {
+            "role": "assistant",
+            "content": "ok",
+            "codex_reasoning_items": [{"encrypted_content": "same-provider-blob"}],
+        }
+    ]
+
+    stripped = _strip_opaque_reasoning_on_provider_switch(agent, api_messages)
+
+    assert stripped == 0
+    assert api_messages[0]["codex_reasoning_items"][0]["encrypted_content"] == "same-provider-blob"
+
+
 # ---------------------------------------------------------------------------
 # Fix D: entitlement 403 must NOT trigger credential-pool refresh loop
 # ---------------------------------------------------------------------------
