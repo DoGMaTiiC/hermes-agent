@@ -45,6 +45,9 @@ import logging
 import os
 import re
 import asyncio
+import shutil
+import subprocess
+from pathlib import Path
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import httpx  # noqa: F401 — kept at module top so tests can patch tools.web_tools.httpx
 # After the web-provider plugin migration (PR #25182), the Firecrawl SDK
@@ -153,8 +156,8 @@ def _get_backend() -> str:
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
-        ("scrapling", _scrapling_package_importable()),
         ("searxng", _has_env("SEARXNG_URL")),
+        ("scrapling", _scrapling_package_importable()),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
         ("ddgs", _ddgs_package_importable()),
     )
@@ -1376,6 +1379,137 @@ async def web_crawl_tool(
         return tool_error(error_msg)
 
 
+def _find_defuddle_bin() -> Optional[str]:
+    """Locate the Defuddle CLI used by web_clean_extract."""
+    explicit = os.getenv("DEFUDDLE_BIN", "").strip()
+    if explicit:
+        return explicit
+    found = shutil.which("defuddle")
+    if found:
+        return found
+    try:
+        from hermes_constants import get_hermes_home
+
+        bundled = Path(get_hermes_home()) / "node" / "bin" / "defuddle"
+        if bundled.exists():
+            return str(bundled)
+    except Exception:
+        pass
+    return None
+
+
+def check_defuddle_cli() -> bool:
+    """Return True when the Defuddle CLI is available."""
+    return _find_defuddle_bin() is not None
+
+
+def _run_defuddle_parse(defuddle_bin: str, url: str) -> Dict[str, Any]:
+    completed = subprocess.run(
+        [defuddle_bin, "parse", "--markdown", "--json", url],
+        capture_output=True,
+        text=True,
+        timeout=45,
+        check=False,
+    )
+    if completed.returncode != 0:
+        err = (completed.stderr or completed.stdout or "Defuddle failed").strip()
+        return {
+            "url": url,
+            "title": "",
+            "content": "",
+            "description": "",
+            "domain": "",
+            "error": err,
+        }
+    try:
+        data = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        return {
+            "url": url,
+            "title": "",
+            "content": "",
+            "description": "",
+            "domain": "",
+            "error": f"Could not parse Defuddle JSON output: {exc}",
+        }
+    return {
+        "url": url,
+        "title": str(data.get("title") or ""),
+        "content": str(data.get("content") or ""),
+        "description": str(data.get("description") or ""),
+        "domain": str(data.get("domain") or ""),
+        "error": None,
+    }
+
+
+async def web_clean_extract_tool(urls: List[str]) -> str:
+    """Extract clean article/readability markdown from URLs via Defuddle."""
+    defuddle_bin = _find_defuddle_bin()
+    if not defuddle_bin:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "Defuddle CLI not found. Install defuddle or set DEFUDDLE_BIN.",
+            },
+            ensure_ascii=False,
+        )
+
+    results: List[Dict[str, Any]] = []
+    tasks = []
+    for raw_url in urls[:5]:
+        url = str(raw_url)
+        if not is_safe_url(url):
+            results.append(
+                {
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "description": "",
+                    "domain": "",
+                    "error": "Blocked: URL targets a private or internal network address",
+                }
+            )
+            continue
+        blocked = check_website_access(url)
+        if blocked:
+            results.append(
+                {
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "description": "",
+                    "domain": "",
+                    "error": blocked["message"],
+                    "blocked_by_policy": {
+                        "host": blocked["host"],
+                        "rule": blocked["rule"],
+                        "source": blocked["source"],
+                    },
+                }
+            )
+            continue
+        tasks.append(asyncio.to_thread(_run_defuddle_parse, defuddle_bin, url))
+
+    if tasks:
+        extracted = await asyncio.gather(*tasks, return_exceptions=True)
+        for item in extracted:
+            if isinstance(item, BaseException):
+                results.append(
+                    {
+                        "url": "",
+                        "title": "",
+                        "content": "",
+                        "description": "",
+                        "domain": "",
+                        "error": f"Defuddle extraction failed: {item}",
+                    }
+                )
+            else:
+                results.append(item)
+
+    return json.dumps({"results": results}, indent=2, ensure_ascii=False)
+
+
 # Convenience function to check Firecrawl credentials
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
@@ -1550,6 +1684,23 @@ WEB_EXTRACT_SCHEMA = {
     }
 }
 
+WEB_CLEAN_EXTRACT_SCHEMA = {
+    "name": "web_clean_extract",
+    "description": "Extract clean article/readability text from web page URLs using Defuddle. Prefer this for articles, blog posts, documentation pages, and Obsidian/web-clipping style reading. For structured data, lists, products, crawl targets, PDFs, or pages where readability extraction loses useful structure, use web_extract instead.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "urls": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of article/documentation URLs to extract clean markdown from (max 5 URLs per call)",
+                "maxItems": 5
+            }
+        },
+        "required": ["urls"]
+    }
+}
+
 registry.register(
     name="web_search",
     toolset="web",
@@ -1570,5 +1721,17 @@ registry.register(
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",
+    max_result_size_chars=100_000,
+)
+registry.register(
+    name="web_clean_extract",
+    toolset="web",
+    schema=WEB_CLEAN_EXTRACT_SCHEMA,
+    handler=lambda args, **kw: web_clean_extract_tool(
+        args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else []),
+    check_fn=check_defuddle_cli,
+    requires_env=[],
+    is_async=True,
+    emoji="🧹",
     max_result_size_chars=100_000,
 )

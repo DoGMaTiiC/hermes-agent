@@ -1105,6 +1105,8 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
     language = str(xai_config.get("language", DEFAULT_XAI_LANGUAGE)).strip() or DEFAULT_XAI_LANGUAGE
     sample_rate = int(xai_config.get("sample_rate", DEFAULT_XAI_SAMPLE_RATE))
     bit_rate = int(xai_config.get("bit_rate", DEFAULT_XAI_BIT_RATE))
+    speed = float(xai_config.get("speed", tts_config.get("speed", 1.0)))
+    text_normalization = _xai_bool_config(xai_config.get("text_normalization"), False)
     auto_speech_tags = _xai_bool_config(
         xai_config.get("auto_speech_tags", xai_config.get("speech_tags")),
         DEFAULT_XAI_AUTO_SPEECH_TAGS,
@@ -1126,6 +1128,10 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
         "voice_id": voice_id,
         "language": language,
     }
+    if speed != 1.0:
+        payload["speed"] = max(0.7, min(1.5, speed))
+    if text_normalization:
+        payload["text_normalization"] = True
     if (
         codec != "mp3"
         or sample_rate != DEFAULT_XAI_SAMPLE_RATE
