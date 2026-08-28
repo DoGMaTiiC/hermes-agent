@@ -130,6 +130,19 @@ Verify with `./venv/bin/python -c "import hindsight_api"` — if it raises
 
 ---
 
+## 8. Scrapling extract-only backend — free local `web_extract` (ACTIVE — tested)
+
+
+|                  |                                                                                                                                                                                                                                                                                                                                                        |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| commit           | `49c2f16a5`                                                                                                                                                                                                                                                                                                                                            |
+| file:line        | `plugins/web/scrapling/{__init__.py,plugin.yaml,provider.py}` + `tools/web_tools.py` (no change, uses registry)                                                                                                                                                                                                                                       |
+| what             | `ScraplingWebSearchProvider` (`extract-only`, `supports_search=False`, `supports_extract=True`) via `scrapling.fetchers.Fetcher.get` + `markdownify`. `is_available()` checks `import scrapling, markdownify`. Plugin `web-scrapling` (`provides_web_providers: [scrapling]`) registered via `ctx.register_web_search_provider`. Config `web.extract_backend: scrapling` + `web.search_backend: searxng` é o par free-first (searxng local container + scrapling local extract, sem API keys). |
+| why it exists    | `web_extract` não tem backend free nativo upstream (todos `supports_extract=True` exigem `*_API_KEY`: exa/tavily/firecrawl/parallel/keenable). Sem scrapling, `searxng`/`ddgs`/`brave`/`xai` são `search-only` e extract caía no `keyless exa` instável ou em `firecrawl` default sem key. Scrapling fecha o par free local. Criado em `351b54322` (2026-07-01) e perdido no diverge `main` (539 behind), restaurado em `49c2f16a5` (2026-08-28). |
+| deps             | `scrapling==0.4.14`, `markdownify==1.2.3`, `ddgs==9.14.4`, `curl_cffi==0.16.0`, `browserforge==1.2.4`, `playwright==1.62.0` no `venv` (`~/hermes-agent/venv`). `uv sync` + `hindsight reinstall` desinstalam esses extras — precisam de reinstall pós-sync (ver `~/.hermes/scripts/hermes-update.sh` §4). |
+| test             | `venv/bin/python -c \"from scrapling import Fetcher; Fetcher.get(\"https://example.com\")\"` + `discover_plugins(); get_provider(\"scrapling\").is_available()==True` + `await web_extract_tool([\"https://example.com\"])` retorna `content` markdown sem `No module named playwright`. Searxng `Up 8 days` em `127.0.0.1:8888` (`curl /healthz OK`). |
+| why not upstream | Upstream não tem extract free local; `exa`/`firecrawl` no `pyproject.toml` são extras pagos. Scrapling é fork-only; se upstream aceitar um extract free, este patch pode ser alinhado/descartado. Até lá, o rebase deve manter `plugins/web/scrapling/` (via stash `-u` + `stash apply`, ou como commit `49c2f16` no topo). |
+
 ## Why these can't be plugins (so nobody tries the plugin route)
 
 - `pre_api_request` is an **observer**: `agent/conversation_loop.py:2190-2230` invokes it and consumes NO return value (telemetry/observability only). It cannot inject or modify the request.
