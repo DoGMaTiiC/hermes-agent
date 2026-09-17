@@ -142,7 +142,8 @@ def finish_text_response(
     # delivery channel (gateway status message / CLI print). NEVER appended to messages/api_messages:
     # conversation context and the cached prompt prefix stay byte-identical.
     from agent.agent_runtime_helpers import (
-        intent_ack_continuation_mode, promoted_reasoning_announces_action, trailing_continue_intent
+        ends_in_tool_call_xml, intent_ack_continuation_mode, promoted_reasoning_announces_action,
+        trailing_continue_intent,
     )
 
     _ack_mode = intent_ack_continuation_mode(agent)
@@ -213,17 +214,26 @@ def finish_text_response(
         final_msg["api_content"] = final_response
 
     # Dropped tool-call recovery (copilot/Claude): finish_reason="tool_calls" with empty
-    # tool_calls would end the turn unstarted; re-prompt (max 3 CONSECUTIVE stalls).
-    if (
-        finish_reason == "tool_calls"
+    # tool_calls would end the turn unstarted; re-prompt (max 3 CONSECUTIVE stalls). The
+    # text-channel shape (#103483) is the same failure on a plain stop: the content tail is
+    # serialized tool-call XML — the model tried to call a tool, the call never became a
+    # function_call item, and the leftover prefix must not be delivered as the answer.
+    _dropped_toolcall = finish_reason == "tool_calls" and not assistant_message.tool_calls
+    _text_channel_call = (
+        finish_reason == "stop"
         and not assistant_message.tool_calls
+        and ends_in_tool_call_xml(assistant_message.content)
+    )
+    if (
+        (_dropped_toolcall or _text_channel_call)
         and getattr(agent, "_dropped_toolcall_retries", 0) < 3
     ):
         agent._dropped_toolcall_retries = getattr(agent, "_dropped_toolcall_retries", 0) + 1
         logger.warning(
-            "finish_reason=tool_calls with empty tool_calls array "
-            "(narration only) — re-prompting to emit the call "
+            "finish_reason=%s with no tool_calls (%s) — re-prompting to emit the call "
             "(retry %d/3, model=%s provider=%s)",
+            finish_reason,
+            "empty array" if _dropped_toolcall else "text-channel serialization",
             agent._dropped_toolcall_retries, agent.model, agent.provider,
         )
         agent._emit_status(

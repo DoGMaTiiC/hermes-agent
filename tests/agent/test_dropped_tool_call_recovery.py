@@ -192,3 +192,106 @@ class TestDroppedToolCallRecovery:
             "ephemeral scaffolding so they are never persisted."
         )
 
+
+
+def _text_channel_call_response(content: str):
+    """A finish_reason=stop response whose content tail is serialized tool-call XML.
+
+    The #103483 shape: the model's next native call was serialized onto the text
+    channel instead of the tool_calls channel, so the parsed tool_calls array is
+    empty and the raw XML sits in content."""
+    from tests.agent.test_run_agent import _mock_assistant_msg
+    return SimpleNamespace(
+        id="chatcmpl-textchannel",
+        model="test/model",
+        choices=[SimpleNamespace(
+            index=0,
+            message=_mock_assistant_msg(content=content, tool_calls=None),
+            finish_reason="stop",
+        )],
+        usage=None,
+    )
+
+
+# The field shape: a prefix the model meant as narration, then the serialized call.
+# Stripping the XML leaves the prefix non-empty, which is why the empty-response
+# ladder never fired and the turn reported success with no call run.
+_TEXT_CHANNEL_SHAPE = (
+    "redox=default.hermes_search_files Hollywood"
+    "<atem:function_calls>\n"
+    '<atem:invoke name="default.hermes_search_files">\n'
+    '<atem:parameter name="pattern">Hollywood</atem:parameter>\n'
+    "</atem:invoke>\n"
+    "</atem:function_calls>"
+)
+
+
+class TestTextChannelToolCallRecovery:
+    def test_xml_tail_reprompts_instead_of_exiting(self, loop_agent):
+        """A stop whose content ends in tool-call XML must re-prompt (the call never
+        became a function_call item), not deliver the leftover prefix as the answer."""
+        from tests.agent.test_run_agent import _mock_response
+
+        loop_agent.client.chat.completions.create.side_effect = [
+            _text_channel_call_response(_TEXT_CHANNEL_SHAPE),
+            _mock_response(content="Searched; here are the results.", finish_reason="stop"),
+        ]
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("find Hollywood references")
+
+        assert loop_agent.client.chat.completions.create.call_count == 2, (
+            "A text-channel tool-call serialization must trigger a re-prompt (second "
+            "API call), not exit with the leftover prefix as the final answer."
+        )
+        second_call = loop_agent.client.chat.completions.create.call_args_list[1]
+        msgs = second_call.kwargs.get("messages") or second_call.args[0].get("messages")
+        last_user = next((m for m in reversed(msgs) if m.get("role") == "user"), None)
+        assert last_user is not None
+        assert "tool call" in (last_user.get("content") or "").lower()
+        assert "Searched; here are the results." in result["final_response"]
+
+    def test_xml_tail_shape_is_bounded(self, loop_agent):
+        """A model that keeps serializing the call must be re-prompted a bounded
+        number of times, then the turn ends (no infinite loop)."""
+        from tests.agent.test_run_agent import _mock_response
+
+        loop_agent.client.chat.completions.create.side_effect = [
+            _text_channel_call_response(_TEXT_CHANNEL_SHAPE) for _ in range(9)
+        ] + [_mock_response(content="done", finish_reason="stop")]
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("find it")
+
+        assert loop_agent.client.chat.completions.create.call_count <= 4
+        assert result is not None
+
+    def test_prose_ends_after_the_xml_is_unaffected(self, loop_agent):
+        """XML mid-text followed by real closing prose is a genuine answer — the
+        trigger is tail-anchored and must not fire."""
+        from tests.agent.test_run_agent import _mock_response
+
+        loop_agent.client.chat.completions.create.side_effect = [
+            _mock_response(
+                content="The pattern <tool_calls> is what we strip. Rest of the answer.",
+                finish_reason="stop",
+            ),
+        ]
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("explain")
+
+        assert loop_agent.client.chat.completions.create.call_count == 1
+        assert "Rest of the answer." in result["final_response"]

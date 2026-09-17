@@ -70,6 +70,34 @@ _UNTERMINATED_TOOL_CALL_PATTERN = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# A content tail that is nothing but serialized tool-call XML (leading text allowed): the
+# model tried to call a tool on the text channel, the call never became a `function_call`
+# item, and the leftover prefix must not be delivered as the final answer (#103483) — the
+# turn is re-prompted by `agent/turn_final_response.py`. Tail-anchored on purpose: an
+# answer that merely discusses such XML keeps its trailing prose.
+_TOOL_CALL_TAIL_CLOSER_PATTERN = re.compile(
+    rf'</(?:(?:[\w.-]+:)?(?:{"|".join(_TOOL_CALL_TAG_NAMES)}|function))>\s*$', re.IGNORECASE
+)
+_TOOL_CALL_TAIL_OPENER_PATTERN = re.compile(
+    rf'(?:^|\n)[ \t]*<(?:[\w.-]+:)?(?:{"|".join(_TOOL_CALL_TAG_NAMES)})\b[^>]*>$', re.IGNORECASE
+)
+
+
+def ends_in_tool_call_xml(content: Any) -> bool:
+    """Whether *content* ends in serialized tool-call XML, so its leading prose is not an answer.
+
+    Covers the reported shapes: a closed block's closer or a stray closer at the tail, and an
+    unterminated opener at a line boundary (stream cut mid-serialization).
+    """
+    text = _flatten_content_text(content) if content else ""
+    if not isinstance(text, str) or "<" not in text:
+        return False
+    text = text.rstrip()
+    return bool(
+        _TOOL_CALL_TAIL_CLOSER_PATTERN.search(text)
+        or _TOOL_CALL_TAIL_OPENER_PATTERN.search(text)
+    )
+
 
 def _ra():
     """Lazy ``run_agent`` reference for test-patch routing."""
