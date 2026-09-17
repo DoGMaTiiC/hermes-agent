@@ -47,10 +47,11 @@ class StreamDeliveryMixin:
     def _reset_stream_delivery_tracking(self) -> None:
         """Reset tracking for text delivered during the current model response.
 
-        Flushes the think scrubber's benign tail first, routed through the context scrubber (a span
-        straddling the boundary must still be caught), then the context scrubber's own tail.
+        Flushes the think scrubber's benign tail first, routed through the tool-call and context
+        scrubbers (a span straddling the boundary must still be caught), then their own tails.
         """
         think_scrubber = getattr(self, "_stream_think_scrubber", None)
+        toolcall_scrubber = getattr(self, "_stream_toolcall_scrubber", None)
         ctx_scrubber = getattr(self, "_stream_context_scrubber", None)
 
         def deliver(tail: str) -> None:
@@ -69,7 +70,12 @@ class StreamDeliveryMixin:
         # reasoning content as regular response text).
         if think_scrubber is not None:
             think_tail = think_scrubber.flush()
+            if toolcall_scrubber is not None:
+                think_tail = toolcall_scrubber.feed(think_tail)
             deliver(ctx_scrubber.feed(think_tail) if think_tail and ctx_scrubber is not None else think_tail)
+        if toolcall_scrubber is not None:
+            toolcall_tail = toolcall_scrubber.flush()
+            deliver(ctx_scrubber.feed(toolcall_tail) if toolcall_tail and ctx_scrubber is not None else toolcall_tail)
         if ctx_scrubber is not None:
             deliver(ctx_scrubber.flush())
         self._current_streamed_assistant_text = ""
@@ -300,9 +306,15 @@ class StreamDeliveryMixin:
             # tag was split across deltas; memory-context spans split across chunks must not leak to
             # the UI. Legacy callers lack the scrubber attributes and get the whole-string fallbacks.
             think_scrubber = getattr(self, "_stream_think_scrubber", None)
+            toolcall_scrubber = getattr(self, "_stream_toolcall_scrubber", None)
             # See #5719.
             scrubber = getattr(self, "_stream_context_scrubber", None)
             text = think_scrubber.feed(text) if think_scrubber is not None else self._strip_think_blocks(text)
+            # Tool-call XML serialized onto the text channel (#103483): suppressed chunk-safely
+            # so no delta consumer sees it. Legacy callers without the scrubber attributes are
+            # covered by the whole-string strip above.
+            if toolcall_scrubber is not None:
+                text = toolcall_scrubber.feed(text)
             text = scrubber.feed(text) if scrubber is not None else sanitize_context(text)
             # Only strip leading newlines on the first delta — mid-stream "\n" is legitimate markdown.
             # Check the parts list, not the joined property (joining per token copies the whole reply).
