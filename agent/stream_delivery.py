@@ -50,6 +50,19 @@ class StreamDeliveryMixin:
         Flushes the think scrubber's benign tail first, routed through the tool-call and context
         scrubbers (a span straddling the boundary must still be caught), then their own tails.
         """
+        self._flush_stream_scrubber_tails()
+        self._current_streamed_assistant_text = ""
+
+    def _flush_stream_scrubber_tails(self) -> None:
+        """Deliver benign tails held by the streaming scrubbers at a logical end of stream.
+
+        Same think → tool-call → context chain as the per-turn reset, but WITHOUT clearing
+        ``_current_streamed_assistant_text``: finalization still needs the streamed-text
+        record, and the next per-turn reset flushes nothing twice (each scrubber resets on
+        flush). Called on every successful stream end (see ``_with_stream_emitters``) so a
+        response ending in a safe partial tag (``ordinary suffix <foo``) reaches consumers
+        in full instead of being discarded by the next reset.
+        """
         think_scrubber = getattr(self, "_stream_think_scrubber", None)
         toolcall_scrubber = getattr(self, "_stream_toolcall_scrubber", None)
         ctx_scrubber = getattr(self, "_stream_context_scrubber", None)
@@ -78,7 +91,6 @@ class StreamDeliveryMixin:
             deliver(ctx_scrubber.feed(toolcall_tail) if toolcall_tail and ctx_scrubber is not None else toolcall_tail)
         if ctx_scrubber is not None:
             deliver(ctx_scrubber.flush())
-        self._current_streamed_assistant_text = ""
 
     @property
     def _current_streamed_assistant_text(self) -> str:

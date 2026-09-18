@@ -83,11 +83,41 @@ _TOOL_CALL_TAIL_OPENER_PATTERN = re.compile(
 )
 
 
+# A line-anchored tool-call opener with no closer anywhere after it: the stream was
+# cut after nested content, or inside the outer closer itself. Closed blocks (an opener
+# followed by its closer) do not match — an answer that merely discusses such XML keeps
+# its trailing prose.
+_UNTERMINATED_OUTER_BLOCK_OPENER_PATTERN = re.compile(
+    rf'(?:^|\n)[ \t]*<(?:[\w.-]+:)?({"|".join(_TOOL_CALL_TAG_NAMES)})\b[^>]*>',
+    re.IGNORECASE,
+)
+_OUTER_BLOCK_CLOSER_PATTERNS = {
+    name: re.compile(rf'</(?:[\w.-]+:)?{name}>', re.IGNORECASE)
+    for name in _TOOL_CALL_TAG_NAMES
+}
+
+
+def _has_unterminated_outer_block(text: str) -> bool:
+    """Whether a line-anchored tool-call opener never gets its closer.
+
+    Covers a stream cut after nested content (``<invoke>`` partials) or inside the outer
+    closer itself (a partial ``</…`` is no closer), where the tail patterns alone return
+    false and the leftover prefix would be accepted as the final answer.
+    """
+    for match in _UNTERMINATED_OUTER_BLOCK_OPENER_PATTERN.finditer(text):
+        closer = _OUTER_BLOCK_CLOSER_PATTERNS[match.group(1).lower()]
+        if not closer.search(text, match.end()):
+            return True
+    return False
+
+
 def ends_in_tool_call_xml(content: Any) -> bool:
     """Whether *content* ends in serialized tool-call XML, so its leading prose is not an answer.
 
-    Covers the reported shapes: a closed block's closer or a stray closer at the tail, and an
-    unterminated opener at a line boundary (stream cut mid-serialization).
+    Covers the reported shapes: a closed block's closer or a stray closer at the tail, an
+    unterminated opener at a line boundary (stream cut mid-serialization), and an outer
+    block left open anywhere through the tail (cut after nested content or inside the
+    outer closer).
     """
     text = _flatten_content_text(content) if content else ""
     if not isinstance(text, str) or "<" not in text:
@@ -96,6 +126,7 @@ def ends_in_tool_call_xml(content: Any) -> bool:
     return bool(
         _TOOL_CALL_TAIL_CLOSER_PATTERN.search(text)
         or _TOOL_CALL_TAIL_OPENER_PATTERN.search(text)
+        or _has_unterminated_outer_block(text)
     )
 
 

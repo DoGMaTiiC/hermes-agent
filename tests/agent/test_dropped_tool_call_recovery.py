@@ -232,6 +232,8 @@ class TestTextChannelToolCallRecovery:
         became a function_call item), not deliver the leftover prefix as the answer."""
         from tests.agent.test_run_agent import _mock_response
 
+        # Recovery needs a callable tool: with no tools a closer-like tail is prose.
+        loop_agent.valid_tool_names = {"default.hermes_search_files"}
         loop_agent.client.chat.completions.create.side_effect = [
             _text_channel_call_response(_TEXT_CHANNEL_SHAPE),
             _mock_response(content="Searched; here are the results.", finish_reason="stop"),
@@ -260,6 +262,8 @@ class TestTextChannelToolCallRecovery:
         number of times, then the turn ends (no infinite loop)."""
         from tests.agent.test_run_agent import _mock_response
 
+        # Recovery needs a callable tool: with no tools a closer-like tail is prose.
+        loop_agent.valid_tool_names = {"default.hermes_search_files"}
         loop_agent.client.chat.completions.create.side_effect = [
             _text_channel_call_response(_TEXT_CHANNEL_SHAPE) for _ in range(9)
         ] + [_mock_response(content="done", finish_reason="stop")]
@@ -295,3 +299,108 @@ class TestTextChannelToolCallRecovery:
 
         assert loop_agent.client.chat.completions.create.call_count == 1
         assert "Rest of the answer." in result["final_response"]
+
+
+# A cut outer block: the opener never gets its closer, so the tail patterns alone
+# return false and the leftover prefix would be accepted as the final answer.
+_TEXT_CHANNEL_NESTED_CUT = (
+    "Waiting.\n<atem:function_calls>{}\n<atem:invoke>partial"
+)
+_TEXT_CHANNEL_CLOSER_CUT = (
+    "Waiting.\n<atem:function_calls>{}\n</atem:function_"
+)
+
+
+class TestUnterminatedOuterBlockRecovery:
+    """A stop cut after nested content, or inside the outer closer, still recovers the
+    lost call — while a closed block followed by prose stays a genuine answer."""
+
+    def test_cut_after_nested_content_reprompts(self, loop_agent):
+        from tests.agent.test_run_agent import _mock_response
+
+        loop_agent.valid_tool_names = {"default.hermes_search_files"}
+        loop_agent.client.chat.completions.create.side_effect = [
+            _text_channel_call_response(_TEXT_CHANNEL_NESTED_CUT),
+            _mock_response(content="Searched; here are the results.", finish_reason="stop"),
+        ]
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("find Hollywood references")
+
+        assert loop_agent.client.chat.completions.create.call_count == 2, (
+            "A cut outer block must trigger a re-prompt (second API call), "
+            "not exit with the leftover prefix as the final answer."
+        )
+        assert "Searched; here are the results." in result["final_response"]
+
+    def test_cut_inside_outer_closer_reprompts(self, loop_agent):
+        from tests.agent.test_run_agent import _mock_response
+
+        loop_agent.valid_tool_names = {"default.hermes_search_files"}
+        loop_agent.client.chat.completions.create.side_effect = [
+            _text_channel_call_response(_TEXT_CHANNEL_CLOSER_CUT),
+            _mock_response(content="Searched; here are the results.", finish_reason="stop"),
+        ]
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("find Hollywood references")
+
+        assert loop_agent.client.chat.completions.create.call_count == 2, (
+            "A cut inside the outer closer must trigger a re-prompt (second API call), "
+            "not exit with the leftover prefix as the final answer."
+        )
+        assert "Searched; here are the results." in result["final_response"]
+
+    def test_closed_block_followed_by_prose_is_unaffected(self, loop_agent):
+        from tests.agent.test_run_agent import _mock_response
+
+        loop_agent.valid_tool_names = {"default.hermes_search_files"}
+        loop_agent.client.chat.completions.create.side_effect = [
+            _mock_response(
+                content="<atem:function_calls>x</atem:function_calls> trailing prose here",
+                finish_reason="stop",
+            ),
+        ]
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("explain")
+
+        assert loop_agent.client.chat.completions.create.call_count == 1
+        assert "trailing prose here" in result["final_response"]
+
+
+class TestRecoveryGatedOnCallableTools:
+    """With no callable tools, closer-like prose is a genuine answer: one API call,
+    no re-prompt, no truncation of the turn."""
+
+    def test_closer_like_prose_without_tools_is_delivered(self, loop_agent):
+        from tests.agent.test_run_agent import _mock_response
+
+        assert not loop_agent.valid_tool_names
+        loop_agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="To close it, emit </function>", finish_reason="stop"),
+        ]
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("explain")
+
+        assert loop_agent.client.chat.completions.create.call_count == 1, (
+            "With no callable tools the recovery must not fire on closer-like prose."
+        )
+        assert "To close it, emit" in result["final_response"]

@@ -222,6 +222,10 @@ def finish_text_response(
     _text_channel_call = (
         finish_reason == "stop"
         and not assistant_message.tool_calls
+        # No callable tools: a closer-like tail is legitimate prose mentioning XML
+        # (e.g. "emit </function>"), never a lost call — recovering would re-prompt
+        # a model with nothing to call and truncate the answer.
+        and bool(getattr(agent, "valid_tool_names", None))
         and ends_in_tool_call_xml(assistant_message.content)
     )
     if (
